@@ -27,9 +27,7 @@ terraform {
   }
 }
 
-provider "aws" {
-  region = var.region
-}
+
 
 # VPC Resources
 resource "aws_vpc" "main" {
