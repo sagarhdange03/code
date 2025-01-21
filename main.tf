@@ -5,6 +5,14 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.0"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.0"
+    }
   }
 }
 
@@ -12,166 +20,263 @@ provider "aws" {
   region = var.region
 }
 
-# VPC Module
-module "vpc" {
-  source = "./modules/vpc"
-  
-  vpc_cidr           = var.vpc_cidr
-  environment        = var.environment
-  availability_zones = var.availability_zones
-  public_subnets     = var.public_subnets
-  private_subnets    = var.private_subnets
-}
-
-# EKS Module
-module "eks" {
-  source = "./modules/eks"
-  
-  cluster_name    = var.cluster_name
-  cluster_version = var.cluster_version
-  vpc_id          = module.vpc.vpc_id
-  private_subnets = module.vpc.private_subnet_ids
-  
-  node_groups = {
-    managed_group = {
-      desired_size = 2
-      max_size     = 4
-      min_size     = 1
-      instance_types = ["t3.medium"]
-    }
-  }
-}
-
-# AWS Control Tower Module
-module "control_tower" {
-  source = "./modules/control_tower"
-  
-  account_name = var.account_name
-  email        = var.account_email
-  org_unit     = var.organizational_unit
-}
-
-# DynamoDB for State Management
-module "dynamodb" {
-  source = "./modules/dynamodb"
-  
-  table_name = "aft-request-table"
-  hash_key   = "id"
-}
-
-# CodeBuild Projects
-module "codebuild" {
-  source = "./modules/codebuild"
-  
-  project_name = "aft-account-customizations"
-  vpc_id       = module.vpc.vpc_id
-  subnets      = module.vpc.private_subnet_ids
-}
-
-# Add-ons Module
-module "addons" {
-  source = "./modules/addons"
-  
-  cluster_name     = module.eks.cluster_name
-  cluster_endpoint = module.eks.cluster_endpoint
-  cluster_ca       = module.eks.cluster_ca_certificate
-}
-
-# modules/vpc/main.tf
-resource "aws_vpc" {
+# VPC Resources
+resource "aws_vpc" "main" {
   cidr_block           = var.vpc_cidr
   enable_dns_hostnames = true
   enable_dns_support   = true
-  
+
   tags = {
     Name = "${var.environment}-vpc"
   }
 }
 
 resource "aws_subnet" "public" {
-  count             = length(var.public_subnets)
+  count             = length(var.availability_zones)
   vpc_id            = aws_vpc.main.id
   cidr_block        = var.public_subnets[count.index]
   availability_zone = var.availability_zones[count.index]
-  
+
+  map_public_ip_on_launch = true
+
   tags = {
-    Name = "${var.environment}-public-${count.index + 1}"
+    Name                                          = "${var.environment}-public-${count.index + 1}"
+    "kubernetes.io/cluster/${var.cluster_name}"   = "shared"
+    "kubernetes.io/role/elb"                      = 1
   }
 }
 
 resource "aws_subnet" "private" {
-  count             = length(var.private_subnets)
+  count             = length(var.availability_zones)
   vpc_id            = aws_vpc.main.id
   cidr_block        = var.private_subnets[count.index]
   availability_zone = var.availability_zones[count.index]
-  
+
   tags = {
-    Name = "${var.environment}-private-${count.index + 1}"
+    Name                                          = "${var.environment}-private-${count.index + 1}"
+    "kubernetes.io/cluster/${var.cluster_name}"   = "shared"
+    "kubernetes.io/role/internal-elb"             = 1
   }
 }
 
-# modules/eks/main.tf
+# Internet Gateway
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "${var.environment}-igw"
+  }
+}
+
+# NAT Gateway
+resource "aws_eip" "nat" {
+  count  = length(var.availability_zones)
+  domain = "vpc"
+}
+
+resource "aws_nat_gateway" "main" {
+  count         = length(var.availability_zones)
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
+
+  tags = {
+    Name = "${var.environment}-nat-${count.index + 1}"
+  }
+}
+
+# Route Tables
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = {
+    Name = "${var.environment}-public-rt"
+  }
+}
+
+resource "aws_route_table" "private" {
+  count  = length(var.availability_zones)
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
+  }
+
+  tags = {
+    Name = "${var.environment}-private-rt-${count.index + 1}"
+  }
+}
+
+# Route Table Associations
+resource "aws_route_table_association" "public" {
+  count          = length(var.availability_zones)
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "private" {
+  count          = length(var.availability_zones)
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private[count.index].id
+}
+
+# EKS Cluster IAM Role
+resource "aws_iam_role" "eks_cluster" {
+  name = "${var.cluster_name}-cluster-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "eks.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+  role       = aws_iam_role.eks_cluster.name
+}
+
+# EKS Node Group IAM Role
+resource "aws_iam_role" "eks_nodes" {
+  name = "${var.cluster_name}-node-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "eks_worker_node_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+  role       = aws_iam_role.eks_nodes.name
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cni_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+  role       = aws_iam_role.eks_nodes.name
+}
+
+resource "aws_iam_role_policy_attachment" "eks_container_registry_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  role       = aws_iam_role.eks_nodes.name
+}
+
+# EKS Cluster
 resource "aws_eks_cluster" "main" {
   name     = var.cluster_name
   version  = var.cluster_version
   role_arn = aws_iam_role.eks_cluster.arn
 
   vpc_config {
-    subnet_ids = var.private_subnets
+    subnet_ids              = aws_subnet.private[*].id
+    endpoint_private_access = true
+    endpoint_public_access  = true
   }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_cluster_policy
+  ]
 }
 
-resource "aws_eks_node_group" "managed" {
-  for_each = var.node_groups
-  
+# EKS Node Group
+resource "aws_eks_node_group" "main" {
   cluster_name    = aws_eks_cluster.main.name
-  node_group_name = each.key
+  node_group_name = "${var.cluster_name}-node-group"
   node_role_arn   = aws_iam_role.eks_nodes.arn
-  subnet_ids      = var.private_subnets
+  subnet_ids      = aws_subnet.private[*].id
 
   scaling_config {
-    desired_size = each.value.desired_size
-    max_size     = each.value.max_size
-    min_size     = each.value.min_size
+    desired_size = var.node_group_desired_size
+    max_size     = var.node_group_max_size
+    min_size     = var.node_group_min_size
   }
 
-  instance_types = each.value.instance_types
+  instance_types = var.node_group_instance_types
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_worker_node_policy,
+    aws_iam_role_policy_attachment.eks_cni_policy,
+    aws_iam_role_policy_attachment.eks_container_registry_policy
+  ]
 }
 
-# modules/addons/main.tf
-resource "helm_release" "vpc_cni" {
-  name       = "aws-vpc-cni"
-  repository = "https://aws.github.io/eks-charts"
-  chart      = "aws-vpc-cni"
-  namespace  = "kube-system"
+# Security Groups
+resource "aws_security_group" "eks_cluster" {
+  name        = "${var.cluster_name}-cluster-sg"
+  description = "Security group for EKS cluster"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "Allow inbound traffic from within VPC"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = [var.vpc_cidr]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 }
 
-resource "helm_release" "prometheus" {
-  name       = "prometheus"
-  repository = "https://prometheus-community.github.io/helm-charts"
-  chart      = "prometheus"
-  namespace  = "monitoring"
+# DynamoDB Table for AFT
+resource "aws_dynamodb_table" "aft_request" {
+  name         = "aft-request-table"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "id"
+
+  attribute {
+    name = "id"
+    type = "S"
+  }
 }
 
-resource "helm_release" "metrics_server" {
-  name       = "metrics-server"
-  repository = "https://kubernetes-sigs.github.io/metrics-server/"
-  chart      = "metrics-server"
-  namespace  = "kube-system"
+# Add-ons configuration through Helm
+provider "helm" {
+  kubernetes {
+    host                   = aws_eks_cluster.main.endpoint
+    cluster_ca_certificate = base64decode(aws_eks_cluster.main.certificate_authority[0].data)
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      args        = ["eks", "get-token", "--cluster-name", aws_eks_cluster.main.name]
+      command     = "aws"
+    }
+  }
 }
 
-resource "helm_release" "cert_manager" {
-  name       = "cert-manager"
-  repository = "https://charts.jetstack.io"
-  chart      = "cert-manager"
-  namespace  = "cert-manager"
+# VPC CNI Add-on
+resource "aws_eks_addon" "vpc_cni" {
+  cluster_name = aws_eks_cluster.main.name
+  addon_name   = "vpc-cni"
 }
 
-resource "helm_release" "coredns" {
-  name       = "coredns"
-  repository = "https://coredns.github.io/helm"
-  chart      = "coredns"
-  namespace  = "kube-system"
+# CoreDNS Add-on
+resource "aws_eks_addon" "coredns" {
+  cluster_name = aws_eks_cluster.main.name
+  addon_name   = "coredns"
 }
 
 # variables.tf
@@ -218,17 +323,44 @@ variable "cluster_version" {
   default     = "1.27"
 }
 
-variable "account_name" {
-  description = "AWS account name"
-  type        = string
+variable "node_group_desired_size" {
+  description = "Desired size of node group"
+  default     = 2
 }
 
-variable "account_email" {
-  description = "AWS account email"
-  type        = string
+variable "node_group_max_size" {
+  description = "Maximum size of node group"
+  default     = 4
 }
 
-variable "organizational_unit" {
-  description = "AWS organizational unit"
-  type        = string
+variable "node_group_min_size" {
+  description = "Minimum size of node group"
+  default     = 1
+}
+
+variable "node_group_instance_types" {
+  description = "Instance types for node group"
+  type        = list(string)
+  default     = ["t3.medium"]
+}
+
+# outputs.tf
+output "cluster_endpoint" {
+  description = "EKS cluster endpoint"
+  value       = aws_eks_cluster.main.endpoint
+}
+
+output "cluster_security_group_id" {
+  description = "Security group ID attached to the EKS cluster"
+  value       = aws_security_group.eks_cluster.id
+}
+
+output "cluster_iam_role_name" {
+  description = "IAM role name associated with EKS cluster"
+  value       = aws_iam_role.eks_cluster.name
+}
+
+output "cluster_certificate_authority_data" {
+  description = "Certificate authority data for the cluster"
+  value       = aws_eks_cluster.main.certificate_authority[0].data
 }
